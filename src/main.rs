@@ -1,3 +1,7 @@
+use reqwest::header::{
+    ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, HeaderMap, HeaderValue, PRAGMA,
+    UPGRADE_INSECURE_REQUESTS, USER_AGENT,
+};
 use reqwest::{Client as HttpClient, Url};
 use scraper::{Html, Selector};
 use serenity::all::ChannelId;
@@ -16,6 +20,8 @@ type AppResult<T> = Result<T, Box<dyn Error>>;
 
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
 const DEFAULT_STATE_FILE: &str = "chapter_state.txt";
+const DEFAULT_USER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
 
 struct Config {
     discord_token: String,
@@ -130,20 +136,44 @@ async fn main() -> AppResult<()> {
 }
 
 fn build_web_client() -> AppResult<HttpClient> {
+    let mut default_headers = HeaderMap::new();
+    default_headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static(DEFAULT_USER_AGENT),
+    );
+    default_headers.insert(
+        ACCEPT,
+        HeaderValue::from_static(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        ),
+    );
+    default_headers.insert(
+        ACCEPT_LANGUAGE,
+        HeaderValue::from_static("en-US,en;q=0.9,fr-FR;q=0.8,fr;q=0.7"),
+    );
+    default_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    default_headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    default_headers.insert(UPGRADE_INSECURE_REQUESTS, HeaderValue::from_static("1"));
+
     Ok(HttpClient::builder()
-        .user_agent("chapter-updater/0.1")
+        .default_headers(default_headers)
         .timeout(Duration::from_secs(20))
         .build()?)
 }
 
 async fn fetch_chapter_number(client: &HttpClient, url: Url) -> AppResult<u32> {
-    let html = client
+    let response = client
         .get(url)
         .send()
-        .await?
-        .error_for_status()?
-        .text()
         .await?;
+
+    let status = response.status();
+    let html = response.text().await?;
+
+    if !status.is_success() {
+        return Err(io::Error::other(format_request_failure(status.as_u16(), &html)).into());
+    }
+
     extract_chapter_number(&html)
 }
 
@@ -203,6 +233,20 @@ async fn notify_new_chapters(
 fn save_chapter_state(path: &Path, chapter_number: u32) -> AppResult<()> {
     fs::write(path, chapter_number.to_string())?;
     Ok(())
+}
+
+fn format_request_failure(status: u16, body: &str) -> String {
+    let preview: String = body
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect();
+
+    format!(
+        "request failed with HTTP {status}. Response preview: {preview}. If this stays on 403 from a VPS, the site is likely blocking the server IP or non-browser traffic."
+    )
 }
 
 fn load_chapter_state(path: &Path) -> AppResult<Option<u32>> {
@@ -278,7 +322,9 @@ fn read_poll_interval_secs() -> AppResult<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_chapter_number, load_chapter_state, save_chapter_state};
+    use super::{
+        extract_chapter_number, format_request_failure, load_chapter_state, save_chapter_state,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -332,5 +378,13 @@ mod tests {
         let saved_chapter = load_chapter_state(&path).unwrap();
 
         assert_eq!(saved_chapter, None);
+    }
+
+    #[test]
+    fn format_request_failure_includes_status_and_body_preview() {
+        let message = format_request_failure(403, "<html> blocked by upstream protection </html>");
+
+        assert!(message.contains("HTTP 403"));
+        assert!(message.contains("blocked by upstream protection"));
     }
 }
