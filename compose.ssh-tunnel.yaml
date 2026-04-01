@@ -1,0 +1,3 @@
+services:
+  chapter-updater:
+    network_mode: host

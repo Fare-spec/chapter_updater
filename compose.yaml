@@ -1,0 +1,9 @@
+services:
+  chapter-updater:
+    image: ghcr.io/fare-spec/chapter_updater:latest
+    container_name: chapter-updater
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data

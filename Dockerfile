@@ -5,7 +5,11 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-RUN cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git/db \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --locked \
+    && cp /app/target/release/chapter_updater /chapter_updater
 
 FROM debian:bookworm-slim AS runtime
 
@@ -18,7 +22,7 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/chapter_updater /usr/local/bin/chapter_updater
+COPY --from=builder /chapter_updater /usr/local/bin/chapter_updater
 
 ENV POLL_INTERVAL_SECS=60
 ENV STATE_FILE=/app/data/chapter_state.txt

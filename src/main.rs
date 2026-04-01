@@ -2,7 +2,7 @@ use reqwest::header::{
     ACCEPT, ACCEPT_LANGUAGE, CACHE_CONTROL, HeaderMap, HeaderValue, PRAGMA,
     UPGRADE_INSECURE_REQUESTS, USER_AGENT,
 };
-use reqwest::{Client as HttpClient, Url};
+use reqwest::{Client as HttpClient, Proxy as HttpProxy, Url};
 use scraper::{Html, Selector};
 use serenity::all::ChannelId;
 use serenity::all::UserId;
@@ -22,12 +22,14 @@ const DEFAULT_POLL_INTERVAL_SECS: u64 = 60;
 const DEFAULT_STATE_FILE: &str = "chapter_state.txt";
 const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36";
+const DEFAULT_STARTUP_RETRY_SECS: u64 = 15;
 
 struct Config {
     discord_token: String,
     channel_id: ChannelId,
     url: Url,
     poll_interval: Duration,
+    proxy_url: Option<String>,
     state_file: PathBuf,
 }
 
@@ -39,6 +41,7 @@ impl Config {
 
         let url = Url::parse(&env::var("URL")?)?;
         let poll_interval = Duration::from_secs(read_poll_interval_secs()?);
+        let proxy_url = read_optional_env("PROXY_URL");
         let state_file = PathBuf::from(
             env::var("STATE_FILE").unwrap_or_else(|_| DEFAULT_STATE_FILE.to_string()),
         );
@@ -48,6 +51,7 @@ impl Config {
             channel_id,
             url,
             poll_interval,
+            proxy_url,
             state_file,
         })
     }
@@ -58,11 +62,9 @@ async fn main() -> AppResult<()> {
     dotenv::dotenv().ok();
 
     let config = Config::from_env()?;
-    let web_client = build_web_client()?;
+    let web_client = build_web_client(config.proxy_url.as_deref())?;
     let discord_http = DiscordHttp::new(&config.discord_token);
-
-    let fetched_chapter = fetch_chapter_number(&web_client, config.url.clone()).await?;
-    let mut last_chapter = initialize_chapter_state(&config.state_file, fetched_chapter)?;
+    let mut last_chapter = initialize_chapter_state(&config, &web_client).await?;
 
     loop {
         sleep(config.poll_interval).await;
@@ -135,7 +137,7 @@ async fn main() -> AppResult<()> {
     }
 }
 
-fn build_web_client() -> AppResult<HttpClient> {
+fn build_web_client(proxy_url: Option<&str>) -> AppResult<HttpClient> {
     let mut default_headers = HeaderMap::new();
     default_headers.insert(
         USER_AGENT,
@@ -155,10 +157,16 @@ fn build_web_client() -> AppResult<HttpClient> {
     default_headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
     default_headers.insert(UPGRADE_INSECURE_REQUESTS, HeaderValue::from_static("1"));
 
-    Ok(HttpClient::builder()
+    let mut builder = HttpClient::builder()
         .default_headers(default_headers)
-        .timeout(Duration::from_secs(20))
-        .build()?)
+        .timeout(Duration::from_secs(20));
+
+    if let Some(proxy_url) = proxy_url {
+        println!("Using configured proxy for chapter fetch.");
+        builder = builder.proxy(HttpProxy::all(proxy_url)?);
+    }
+
+    Ok(builder.build()?)
 }
 
 async fn fetch_chapter_number(client: &HttpClient, url: Url) -> AppResult<u32> {
@@ -265,34 +273,47 @@ fn load_chapter_state(path: &Path) -> AppResult<Option<u32>> {
     }
 }
 
-fn initialize_chapter_state(path: &Path, fetched_chapter: u32) -> AppResult<u32> {
-    match load_chapter_state(path) {
+async fn initialize_chapter_state(config: &Config, client: &HttpClient) -> AppResult<u32> {
+    match load_chapter_state(&config.state_file) {
         Ok(Some(saved_chapter)) => {
             println!(
                 "Loaded saved chapter: {} ({})",
                 saved_chapter,
-                path.display()
+                config.state_file.display()
             );
             Ok(saved_chapter)
         }
-        Ok(None) => {
-            save_chapter_state(path, fetched_chapter)?;
-            println!(
-                "Initial chapter saved: {} ({})",
-                fetched_chapter,
-                path.display()
-            );
-            Ok(fetched_chapter)
-        }
         Err(error) => {
-            eprintln!("Failed to load chapter state: {error}. Reinitializing.");
-            save_chapter_state(path, fetched_chapter)?;
-            println!(
-                "Initial chapter saved: {} ({})",
-                fetched_chapter,
-                path.display()
-            );
-            Ok(fetched_chapter)
+            eprintln!("Failed to load chapter state: {error}. Trying fresh fetch.");
+            initialize_chapter_state_from_fetch(config, client).await
+        }
+        Ok(None) => initialize_chapter_state_from_fetch(config, client).await,
+    }
+}
+
+async fn initialize_chapter_state_from_fetch(
+    config: &Config,
+    client: &HttpClient,
+) -> AppResult<u32> {
+    loop {
+        match fetch_chapter_number(client, config.url.clone()).await {
+            Ok(fetched_chapter) => {
+                save_chapter_state(&config.state_file, fetched_chapter)?;
+                println!(
+                    "Initial chapter saved: {} ({})",
+                    fetched_chapter,
+                    config.state_file.display()
+                );
+                return Ok(fetched_chapter);
+            }
+            Err(error) => {
+                let delay = startup_retry_delay(config.poll_interval);
+                eprintln!(
+                    "Initial fetch failed: {error}. Retrying in {}s.",
+                    delay.as_secs()
+                );
+                sleep(delay).await;
+            }
         }
     }
 }
@@ -313,6 +334,18 @@ fn read_first_env(keys: &[&str]) -> AppResult<String> {
     .into())
 }
 
+fn read_optional_env(key: &str) -> Option<String> {
+    env::var(key).ok().and_then(|value| {
+        let trimmed = value.trim();
+
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
 fn read_poll_interval_secs() -> AppResult<u64> {
     let raw =
         env::var("POLL_INTERVAL_SECS").unwrap_or_else(|_| DEFAULT_POLL_INTERVAL_SECS.to_string());
@@ -320,14 +353,19 @@ fn read_poll_interval_secs() -> AppResult<u64> {
     Ok(raw.parse()?)
 }
 
+fn startup_retry_delay(poll_interval: Duration) -> Duration {
+    poll_interval.min(Duration::from_secs(DEFAULT_STARTUP_RETRY_SECS))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_chapter_number, format_request_failure, load_chapter_state, save_chapter_state,
+        extract_chapter_number, format_request_failure, load_chapter_state, read_optional_env,
+        save_chapter_state, startup_retry_delay,
     };
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn temp_state_file() -> PathBuf {
         let unique = SystemTime::now()
@@ -386,5 +424,39 @@ mod tests {
 
         assert!(message.contains("HTTP 403"));
         assert!(message.contains("blocked by upstream protection"));
+    }
+
+    #[test]
+    fn read_optional_env_ignores_missing_or_blank_values() {
+        unsafe {
+            std::env::remove_var("PROXY_URL");
+        }
+        assert_eq!(read_optional_env("PROXY_URL"), None);
+
+        unsafe {
+            std::env::set_var("PROXY_URL", "   ");
+        }
+        assert_eq!(read_optional_env("PROXY_URL"), None);
+
+        unsafe {
+            std::env::set_var("PROXY_URL", "socks5h://127.0.0.1:1080");
+        }
+        assert_eq!(
+            read_optional_env("PROXY_URL"),
+            Some("socks5h://127.0.0.1:1080".to_string())
+        );
+
+        unsafe {
+            std::env::remove_var("PROXY_URL");
+        }
+    }
+
+    #[test]
+    fn startup_retry_delay_caps_at_fifteen_seconds() {
+        assert_eq!(startup_retry_delay(Duration::from_secs(5)), Duration::from_secs(5));
+        assert_eq!(
+            startup_retry_delay(Duration::from_secs(60)),
+            Duration::from_secs(15)
+        );
     }
 }
